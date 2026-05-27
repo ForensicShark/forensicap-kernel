@@ -78,6 +78,14 @@ jobs:
           make ${{ matrix.variant.defconfig }}
           scripts/kconfig/merge_config.sh -m .config ${{ matrix.variant.overlay }}
           make olddefconfig
+
+          # Suppress the "+" suffix that scripts/setlocalversion appends on
+          # shallow clones (CI uses fetch-depth: 1 which has no annotated
+          # tags reachable from HEAD).  An empty .scmversion file tells
+          # setlocalversion to emit nothing, producing stable kver strings
+          # like "6.12.90-v8-forensicap" instead of "6.12.90-v8-forensicap+".
+          : > .scmversion
+
           echo "--- Resulting kernel version ---"
           make -s kernelrelease
 
