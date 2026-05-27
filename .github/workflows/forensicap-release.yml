@@ -1,0 +1,151 @@
+name: ForensicAP Release Build
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-compile the ForensicAP custom kernel for Pi 4 (bcm2711) and Pi 5
+# (bcm2712) and produce Debian packages via `make bindeb-pkg`.  Output debs
+# are uploaded to the GitHub release when triggered by a kernel-v* tag, and
+# kept as a workflow artifact on workflow_dispatch.
+#
+# Triggers:
+#   workflow_dispatch — manual run via GitHub UI (artifacts only, no release)
+#   tag push (kernel-v*) — full release build + asset upload
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkgversion:
+        description: 'Override KDEB_PKGVERSION (default: forensicap/version + run number)'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'kernel-v*'
+
+env:
+  # ARM64 cross toolchain target.  Uses native arm64 runners when available
+  # (ubuntu-24.04-arm) to skip the cross-compiler entirely.
+  KDEB_COMPRESS: xz
+
+jobs:
+  build:
+    name: Build ${{ matrix.variant.name }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: rpi-v8
+            defconfig: bcm2711_defconfig
+            overlay: forensicap/v8.config
+          - name: rpi-2712
+            defconfig: bcm2712_defconfig
+            overlay: forensicap/v8-16k.config
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev \
+            kmod cpio rsync \
+            dpkg-dev debhelper
+
+      - name: Compute KDEB_PKGVERSION
+        id: pkgver
+        run: |
+          OVERLAY_VER="$(cat forensicap/version | tr -d '[:space:]')"
+          if [ -n "${{ inputs.pkgversion }}" ]; then
+            PKGVER="${{ inputs.pkgversion }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/kernel-v* ]]; then
+            # Strip "kernel-v" prefix from tag so the deb version mirrors the tag.
+            PKGVER="${GITHUB_REF#refs/tags/kernel-v}"
+          else
+            PKGVER="${OVERLAY_VER}.${{ github.run_number }}"
+          fi
+          echo "value=${PKGVER}" >> "${GITHUB_OUTPUT}"
+          echo "Computed KDEB_PKGVERSION: ${PKGVER}"
+
+      - name: Configure kernel
+        run: |
+          make ${{ matrix.variant.defconfig }}
+          scripts/kconfig/merge_config.sh -m .config ${{ matrix.variant.overlay }}
+          make olddefconfig
+          echo "--- Resulting kernel version ---"
+          make -s kernelrelease
+
+      - name: Build kernel + bindeb-pkg
+        env:
+          KDEB_PKGVERSION: ${{ steps.pkgver.outputs.value }}
+        run: |
+          # bindeb-pkg invokes the full pipeline: Image.gz + modules + dtbs +
+          # builddeb script.  Two outputs land in the parent directory:
+          #   ../linux-image-<kver>_<pkgver>_arm64.deb
+          #   ../linux-headers-<kver>_<pkgver>_arm64.deb
+          # plus linux-libc-dev_<pkgver>_arm64.deb on first run.
+          make -j"$(nproc)" bindeb-pkg
+
+      - name: Collect debs
+        run: |
+          mkdir -p artifacts/${{ matrix.variant.name }}
+          # debs are written to the parent of the source tree by the kernel's
+          # builddeb script — relocate them into a per-variant subdirectory so
+          # uploads don't collide between matrix jobs.
+          mv ../linux-image-*.deb   artifacts/${{ matrix.variant.name }}/
+          mv ../linux-headers-*.deb artifacts/${{ matrix.variant.name }}/
+          # linux-libc-dev is per-build but identical for both variants — we
+          # only ship it from rpi-v8 to avoid a collision.
+          if [[ "${{ matrix.variant.name }}" == "rpi-v8" ]]; then
+            mv ../linux-libc-dev_*.deb artifacts/${{ matrix.variant.name }}/ || true
+          else
+            rm -f ../linux-libc-dev_*.deb || true
+          fi
+          ls -la artifacts/${{ matrix.variant.name }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.variant.name }}
+          path: artifacts/${{ matrix.variant.name }}/
+          retention-days: 90
+
+  release:
+    name: Attach debs to GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/kernel-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          # Asset names get a variant prefix so the two rpi-v8 and rpi-2712
+          # debs are distinguishable in the release UI.
+          for variant_dir in artifacts/kernel-*/; do
+              variant="$(basename "${variant_dir}" | sed 's/^kernel-//')"
+              for deb in "${variant_dir}"*.deb; do
+                  base="$(basename "${deb}")"
+                  cp "${deb}" "release/${variant}_${base}"
+              done
+          done
+          ls -la release/
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true
