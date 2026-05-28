@@ -76,7 +76,9 @@ jobs:
       - name: Configure kernel
         run: |
           make ${{ matrix.variant.defconfig }}
-          scripts/kconfig/merge_config.sh -m .config ${{ matrix.variant.overlay }}
+          scripts/kconfig/merge_config.sh -m .config \
+            forensicap/slim.config \
+            ${{ matrix.variant.overlay }}
           make olddefconfig
           # Suppress the "+" suffix that scripts/setlocalversion appends on
           # shallow clones (CI uses fetch-depth: 1 which has no annotated
